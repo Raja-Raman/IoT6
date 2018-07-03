@@ -1,0 +1,273 @@
+// Send room occupancy status to cloud through 8266 Wi-Fi board 
+// use it with cloud11.ino
+// Done: Improved logic: PIR has to fire at least once in 10 minutes to keep the room occupied
+// This is because EM radar gets false triggers from passers-by.
+// Done: The initial commands like RESTARTED_ARDUINO and USE_PROD_URL are somehow not
+// reaching 8266 reliably. (debug why). Now the USE_PROD_URL/USE_TEST_URL message is
+// repeated every 10 minutes.
+// It goes into testing mode where it only reads the staus of PIR and magnetic sensor.
+// This version uses sodftware serial on the ultrasound sensor port to connect 8266
+// NOTE: It sends debug messages over the regular FTDI serial port  
+/*
+ *  PIR : HC-SR 501; RADAR : RCWL 0516 
+ * */
+#include <EEPROM.h>           // bundled with Arduino IDE
+#include <Timer.h>            // Simon Monk:  http://www.simonmonk.org -> Jack Christensen
+#include <SoftwareSerial.h>
+
+//------------------------  configuration section -----------------------------------
+
+#define  SIMULATION     0             // 1 for testing, 0 for production  
+SoftwareSerial SoftSerial(A5, A4);    // Rx,Tx - ultra sound connector
+//SoftwareSerial SoftSerial(12, 11);  // Rx,Tx - MISO and MOSI pins - NRF24 connector
+long baud_rate =  115200L;  // 9600L;  // 
+
+#define STATUS_FREE        0
+#define STATUS_OCCUPIED    1
+#define STATUS_WARNED1     2
+#define STATUS_WARNED2     3
+#define STATUS_RESTARTED1  4   // atmega
+#define STATUS_RESTARTED2  5   // 8266
+
+// Arduino pins
+const byte FREE_PIN   = A3;      // any unconnected analog pin
+const byte pir        = A0;      // 'AD_SEN' connector
+//const byte pir      = A1;       // 'DH11' connector
+const byte radar      = 3;       // 'PIR' connector
+const byte led        = 10;      // active low  
+const byte led2       = A2;      // 'CO2' connector; active low  
+const byte jumper    = 8;       // 'CS' pin of NRF24; to select prod/sensor test mode
+
+// timers and counters
+Timer T;  // software timer
+byte    release_duration = 2;   // can be 1,2 or 3 minutes
+// * Timer durations SHOULD be unsigned LONG int, if they are > 16 bit! 
+unsigned int tick_interval  = 100;       // in milliSec; 10 ticks = 1 second 
+unsigned int status_ticks   = 30*10;     // n*10 ticks = n seconds  
+unsigned int url_ticks      = 605*10;     // n*10 ticks = n seconds  
+unsigned int release_ticks1 = 120*10;   // n*10 ticks = n seconds   // 60
+unsigned int release_ticks2 = 600*10;   // n*10 ticks = n seconds   // 1200
+unsigned int buzzer_ticks1  = 110*10;    // n*10 ticks = n seconds  // 50
+unsigned int buzzer_ticks2  = 590*10;    // n*10 ticks = n seconds  // 1190
+
+//----------------- end of configuration section -----------------------------------
+
+unsigned int pir_tick_counter = 0;
+unsigned int radar_tick_counter = 0;
+unsigned int status_counter = 0;
+boolean  occupied = true;        // occupancy status of the room
+
+void(* restart_arduino) (void) = 0; //declare reset function - jump to address 0
+
+void setup() {    
+    pinMode(radar, INPUT);   
+    pinMode(pir, INPUT);        
+    pinMode(jumper, INPUT_PULLUP);    // jumper connected -> pin will be LOW    
+    boolean sensor_test_mode = !digitalRead(jumper);   // pin LOW -> enter sensor test loop
+    pinMode(led, OUTPUT);    
+    pinMode(led2, OUTPUT);         
+    digitalWrite(led, HIGH);  // active low  
+    digitalWrite(led2, HIGH);  // active low  
+   
+    blinker();   //  this lasts for 2 seconds
+    blinker();   //  more time for 8266 to boot up and be ready for commands  
+     
+    Serial.begin(baud_rate);   
+    Serial.println ("Occupancy sensor starting..");
+    SoftSerial.begin(baud_rate);  
+
+    if (sensor_test_mode) {
+        Serial.println ("ENTERING SENSOR TEST MODE");
+        Serial.println ("For normal operation, disconnect jumper on CE pin [D8].");
+        sensor_test_loop();  // *** THIS IS AN INFINITE LOOP ****
+    }
+    else
+        Serial.print ("Starting regular code in ");
+    if (SIMULATION)
+        Serial.println ("simulation mode ***");
+    else        
+        Serial.println ("production mode.");
+   
+    randomSeed(analogRead(FREE_PIN));  // use the noise from an unconnected pin
+    status_ticks = status_ticks + random(0, 15); // stagger the transmissions
+    Serial.print("Status ticks (mSec): ");
+    Serial.println(status_ticks*100);
+    T.every(tick_interval, ticker);     
+    delay(100);
+    occupied = true;   
+
+    T.after(2000, send_restarted_command);
+}
+
+void send_restarted_command() {
+      Serial.println("Sending RESTARTED_ARDUINO notice to 8266");    
+      SoftSerial.write(STATUS_RESTARTED1); // 8266 sends this info to cloud
+}
+
+// WARNING: THIS IS AN INFINITE LOOP
+// for normal program, the jumper MUST be be disconnected
+void sensor_test_loop() {
+    blinker3();
+    while (1) {
+        digitalWrite (led, !digitalRead(pir));   
+        digitalWrite (led2, !digitalRead(radar));    
+        delay(20); 
+        // TODO: watch dog timer reset
+    }
+}
+
+// the normal program loop
+char c;
+void loop() {
+    T.update();   
+    while (SoftSerial.available())
+        Serial.write(SoftSerial.read());    
+    while (Serial.available()) {
+        c = Serial.read();
+        if (c=='@') {
+            Serial.println("\nNow Arduino will restart !!!");
+            delay(1000);
+            restart_arduino();       
+        }     
+        if (c=='#') {
+            Serial.println("\nEntering sensor test loop ***");
+            Serial.println("Restart Arduino for normal operation");
+            sensor_test_loop();  // infinite loop      
+        }           
+        else
+            SoftSerial.write(c);   
+    }         
+}
+
+void ticker(){
+    read_sensors();  // read PIR and radar...
+    update_status(); // ...and then compute occupancy status     
+}
+
+boolean pir_status, radar_status;
+// You MUST call this before calling update_status
+void read_sensors() { 
+    pir_status = digitalRead(pir);   
+    radar_status = digitalRead(radar);
+    digitalWrite (led, !pir_status);
+    digitalWrite (led2, !radar_status);
+    if (pir_status) pir_tick_counter = 0;      // keep resetting it, if there is any motion
+    if (radar_status) radar_tick_counter = 0;  // keep resetting it, if there is any motion  
+}
+
+// uses the global variable num_hits: Call read_sensors before calling this !
+void update_status() {    
+    pir_tick_counter++;      
+    radar_tick_counter++;    
+    status_counter++;   
+      
+    if (!occupied) {
+        if (pir_status && radar_status)    // both the sensors fired, so occupy the room
+            occupy_room();
+    }
+    if (status_counter == status_ticks) { 
+        send_status();
+        status_counter = 0;
+    }
+
+    if (radar_tick_counter == buzzer_ticks1) {
+        if (occupied)
+            warn();  // warn about the imminent release
+    }
+    if (pir_tick_counter == buzzer_ticks2) {
+        if (occupied)
+            warn();  // warn about the imminent release
+    }
+         
+    if (radar_tick_counter >= release_ticks1){  // even the radar was silent for 2 minutes
+         radar_tick_counter = 0; // to avoid counter overflow during nights/holidays
+         if (occupied)
+            release_room();  
+    }
+    if (pir_tick_counter >= release_ticks2){  // PIR was silent for 10 minutes
+         pir_tick_counter = 0; // to avoid counter overflow during nights/holidays
+         if (occupied)
+            release_room();              
+    }  
+}
+
+void occupy_room() {
+    occupied = true; 
+    Serial.println("Room ccupied");    
+    send_status(); 
+}
+
+// pre-release warning flashes
+void warn() {
+    T.oscillate (led2,50, HIGH, 10);  
+    //the end state is HIGH, i.e, led is off      
+    Serial.println("- About to release room -");    
+}
+
+void release_room() {
+    occupied = false; 
+    Serial.println("Room released");
+    send_status(); 
+}
+
+/*
+ * Status sent to 8266: 1=freee, 2=occupied
+ * (We avoid 0 and 1 because 0 is the default return value when parseInt() at the receiving end fails)
+ */
+boolean simulated_occupied = true;
+void send_status() {
+    if (SIMULATION) {
+        //simulated_occupied = !simulated_occupied;  
+        simulated_occupied = random(0,2);  // [min, max)
+        Serial.print("Sending (s) status: ");
+        Serial.println(simulated_occupied);       
+        SoftSerial.write(simulated_occupied ? STATUS_OCCUPIED : STATUS_FREE);  
+    }
+    else {
+        SoftSerial.write(occupied ? STATUS_OCCUPIED : STATUS_FREE); 
+        Serial.print("Sending (p) status: ");
+        Serial.println(occupied ? STATUS_OCCUPIED : STATUS_FREE);  
+    }
+}
+
+void blinker() {
+    for (int i=0; i<4; i++) {  
+        digitalWrite(led, LOW); 
+        digitalWrite(led2, HIGH);            
+        delay(500);      
+        digitalWrite(led, HIGH);    // active low    
+        digitalWrite(led2, LOW);    // active low       
+        delay(500); 
+    }
+    digitalWrite(led2, HIGH);   
+}
+
+void blinker2() {
+    for (int i=0; i<10; i++) {  
+        digitalWrite(led, LOW); 
+        digitalWrite(led2, HIGH);            
+        delay(100);      
+        digitalWrite(led, HIGH);    // active low    
+        digitalWrite(led2, LOW);    // active low       
+        delay(100); 
+    }
+    digitalWrite(led2, HIGH);   
+}
+
+void blinker3() {
+  for (int i=0; i<3; i++) {  
+        for (int i=0; i<6; i++) {  
+            digitalWrite(led, LOW);  // active low         
+            delay(60);      
+            digitalWrite(led, HIGH);           
+            delay(60); 
+        }
+        for (int i=0; i<6; i++) {  
+            digitalWrite(led2, LOW);  // active low         
+            delay(60);      
+            digitalWrite(led2, HIGH);           
+            delay(60); 
+        }     
+    }
+}
+

@@ -1,0 +1,317 @@
+/************************************************************
+Vz Occupancy sensor board. 
+This code is to be burnt on 8266.
+Use it with occupancy20.ino
+Sends HTTP requests to AWS cloud/ Dweet.io 
+Works in conjunction with occupancy1.ino on the Arduino side.
+************************************************************/
+
+#include <Timer.h>   // https://github.com/SandyWalsh/Timer
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+extern "C" {
+  #include "user_interface.h"
+}
+boolean enable_serial = true;
+
+// comment out this line to disable serial messages
+#define ENABLE_DEBUG
+// serial debugging
+#ifdef ENABLE_DEBUG
+  #define  SERIAL_PRINT(x)  if(enable_serial) Serial.print(x)
+  #define  SERIAL_PRINTLN(x)  if(enable_serial) Serial.println(x)
+#else
+  #define  SERIAL_PRINT(x)
+  #define  SERIAL_PRINTLN(x)
+#endif
+
+ //8266 receives a single character command from PC/Arduino. 
+// (In addition, there may be CR/LF which is ignored).
+#define STATUS_FREE        0
+#define STATUS_OCCUPIED    1
+#define STATUS_WARNED1     2
+#define STATUS_WARNED2     3
+#define STATUS_RESTARTED1  4   // atmega
+#define STATUS_RESTARTED2  5   // 8266
+
+struct {
+    int device_id = 1;   // change this for every device; MUST be unique
+    char *room_id = "\"VC8001\"";     
+    // json payload for all other portals
+    char *payload1 =  "{\"location\":";
+    char *payload2 =  ",\"status\":?}"; 
+
+    // json payload for ThingSpeak
+    char *payload3 =  "{\"api_key\":\"<key>\",\"field1\":?}";
+          
+    // cloud URL for posting the data
+    char * prod_url = "http://52.40.239.77:5000/post_occupancy_status";   // production AWS
+    char * test_url = "https://dweet.io/dweet/for/raja-vz-raman1";         
+    char * dashboard_url = "http://demo.thingsboard.io:8080/api/v1/XXXXXXXXXXX/telemetry";   
+    char * analytics_url = "https://api.thingspeak.com/update";   
+
+    // security for dweet
+    // copy the thumb print from the Dweet web page
+    char * dweet_thumb_print = "4a4e39710b7dd795d23506c1c4bf488d925e3fed";
+    //char * dweet_thumb_print = "4A:4E:39:71:0B:7D:D7:95:D2:35:06:C1:C4:BF:48:8D:92:5E:3F:ED";
+    char *speak_thumb_print = "f9c2656cf9ef7f668bf735fe15ea829f5f55543e";
+    
+    char* ssid = "xxxxxxxxxx"; 
+    char* password = "xxxxxxxxxx";  
+
+    long baud_rate =  115200L;  // 9600L;  // 
+    bool simulation_mode  = false;      // 1 for testing; 0 for production  
+    bool enable_serial = true;
+    bool verbose_mode = true;    
+} C;
+
+// json payload
+char body[128];   // This is the maximum payload length ***
+char body2[128];
+int  body_length;      
+int  body_length2;  
+
+Timer T;
+ 
+void setup() {
+    Serial.begin (C.baud_rate);   
+    delay(250);           // initial garbage generation time
+    SERIAL_PRINTLN("");        
+    SERIAL_PRINTLN("8266 starting..."); 
+
+    strcpy(body, C.payload1);
+    strcat(body, C.room_id);
+    strcat(body, C.payload2);
+    body_length = strlen(body);    
+
+    strcpy(body2, C.payload3);
+    body_length2 = strlen(body2); 
+    SERIAL_PRINT("Device id: ");
+    SERIAL_PRINTLN(C.device_id);    
+    SERIAL_PRINT("Room id: ");
+    SERIAL_PRINTLN(C.room_id);
+    SERIAL_PRINT("cloud URL: ");
+    SERIAL_PRINTLN(C.prod_url);
+    SERIAL_PRINT("test URL: ");
+    SERIAL_PRINTLN(C.test_url);    
+    SERIAL_PRINT("dashboard URL: ");
+    SERIAL_PRINTLN(C.dashboard_url);       
+    SERIAL_PRINT("analytics URL: ");
+    SERIAL_PRINTLN(C.analytics_url);     
+    SERIAL_PRINT ("Payload 1: "); 
+    SERIAL_PRINTLN (body);        
+    SERIAL_PRINT ("Payload 1 length: "); 
+    SERIAL_PRINTLN (body_length);      
+    SERIAL_PRINT ("Payload 2: "); 
+    SERIAL_PRINTLN (body2);        
+    SERIAL_PRINT ("Payload 2 length: "); 
+    SERIAL_PRINTLN (body_length2);   
+    
+    delay(1000);  // time to flush ?
+    connect_wifi();
+    T.after(1000, send_restarted_status);  
+}
+
+void loop() {
+    T.update();
+    read_serial();
+}
+
+// called by the timer
+void send_restarted_status() {
+    send_status(STATUS_RESTARTED2);
+}
+
+void reset_watchdog() {
+    ESP.wdtFeed();
+}
+
+void connect_wifi() {
+    SERIAL_PRINTLN("\nConnecting to hot spot: ");
+    SERIAL_PRINTLN(C.ssid);  
+    
+    WiFi.begin(C.ssid, C.password);
+    // Wait for connection AND IP address from DHCP
+    byte MAX_ATTEMPTS = 25;
+    byte attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < MAX_ATTEMPTS) {        
+        delay(500);
+        if (C.verbose_mode) SERIAL_PRINT (".");
+        attempts++;
+    }
+    SERIAL_PRINTLN ("!");
+    delay(500);  // time to recover ?
+    if (WiFi.status() == WL_CONNECTED) {
+        SERIAL_PRINTLN ("WiFi connected.");  
+        SERIAL_PRINTLN ("IP address: ");
+        SERIAL_PRINTLN (WiFi.localIP()); 
+    }  
+    else
+        SERIAL_PRINTLN ("* Cannot connect to WiFi *");
+}
+
+int command; // single character command
+boolean read_serial() {
+    if (!Serial.available())
+        return false;
+    command = Serial.parseInt(); // returns 0 if no integer found in serial buffer
+    
+    SERIAL_PRINT("Received Command from Arduino: ");
+    SERIAL_PRINTLN (command);
+    if (command < STATUS_FREE || command > STATUS_RESTARTED2) {
+        SERIAL_PRINTLN ("Invalid command");
+        return (false);
+    }
+    send_status(command);
+    return (true);
+}
+
+void send_status (byte status) {   
+    makePayload(status); // status is now stored in the payloads
+    send2CloudUrl(); 
+    T.after(2000, send2TestUrl);
+    T.after(4000, send2DashboardUrl);
+    T.after(6000, send2AnalyticsUrl);
+}
+
+// receives one byte commands in the form of ascii characters
+void makePayload(byte status) {
+    body[body_length-2] = '0'+status;
+    body2[body_length2-2] = '0'+status;
+//    body[body_length-2] = status;
+//    body2[body_length2-2] = status;    
+}
+
+HTTPClient htclient;
+bool server_connected = false;
+
+void send2CloudUrl() {
+    if(WiFi.status()!= WL_CONNECTED) {
+        SERIAL_PRINTLN("No Wi-Fi connection");
+        connect_wifi();
+        return;   
+    }
+    bool server_connected = htclient.begin (C.prod_url);        
+    if (!server_connected) {
+        SERIAL_PRINTLN("Could not connect to AWS server");
+        return;   
+    }
+    if (C.verbose_mode)
+        SERIAL_PRINTLN("Connected to AWS server");
+    htclient.addHeader("Content-Type", "application/json");
+    if (C.verbose_mode)
+        SERIAL_PRINTLN(body);
+    int retcode = htclient.POST(body); 
+    SERIAL_PRINTLN(retcode);
+    if (retcode < 0) {
+        SERIAL_PRINTLN("Cannot POST to AWS server..");
+        SERIAL_PRINTLN(htclient.errorToString(retcode).c_str());
+    }
+    else {
+        String response = htclient.getString(); 
+        if (C.verbose_mode)
+            SERIAL_PRINTLN(response);
+    }
+    //SERIAL_PRINTLN("Client disconnected.\n");
+    htclient.end();   // close  
+}
+
+void send2TestUrl() {
+    if(WiFi.status()!= WL_CONNECTED) {
+        SERIAL_PRINTLN("No Wi-Fi connection");
+        connect_wifi();
+        return;   
+    }
+    bool server_connected = htclient.begin (C.test_url, C.dweet_thumb_print);        
+    if (!server_connected) {
+        SERIAL_PRINTLN("Could not connect to test server");
+        return;   
+    }
+    if (C.verbose_mode)
+        SERIAL_PRINTLN("Connected to test server");
+    htclient.addHeader("Content-Type", "application/json");
+    if (C.verbose_mode)
+        SERIAL_PRINTLN(body);
+    int retcode = htclient.POST(body); 
+    SERIAL_PRINTLN(retcode);
+    if (retcode < 0) {
+        SERIAL_PRINTLN("Cannot POST to test server..");
+        SERIAL_PRINTLN(htclient.errorToString(retcode).c_str());
+    }
+    else {
+        String response = htclient.getString(); 
+        if (C.verbose_mode){
+            SERIAL_PRINTLN(response);
+            SERIAL_PRINTLN("");
+        }
+    }
+    //SERIAL_PRINTLN("Client disconnected.\n");
+    htclient.end();   // close        
+}
+
+
+void send2DashboardUrl() {
+    if(WiFi.status()!= WL_CONNECTED) {
+        SERIAL_PRINTLN("No Wi-Fi connection");
+        connect_wifi();
+        return;   
+    }
+    bool server_connected = htclient.begin (C.dashboard_url);          
+    if (!server_connected) {
+        SERIAL_PRINTLN("Could not connect to dashboard server");
+        return;   
+    }
+    if (C.verbose_mode)
+        SERIAL_PRINTLN("Connected to dashboard server");
+    htclient.addHeader("Content-Type", "application/json");
+    if (C.verbose_mode)
+        SERIAL_PRINTLN(body);
+    int retcode = htclient.POST(body); 
+    SERIAL_PRINTLN(retcode);
+    if (retcode < 0) {
+        SERIAL_PRINTLN("Cannot POST to dashboard server..");
+        SERIAL_PRINTLN(htclient.errorToString(retcode).c_str());
+    }
+    else {
+        String response = htclient.getString(); 
+        if (C.verbose_mode){
+            SERIAL_PRINTLN(response);
+            SERIAL_PRINTLN("");
+        }
+    }
+    //SERIAL_PRINTLN("Client disconnected.\n");
+    htclient.end();   // close    
+}
+
+void send2AnalyticsUrl() {
+    if(WiFi.status()!= WL_CONNECTED) {
+        SERIAL_PRINTLN("No Wi-Fi connection");
+        connect_wifi();
+        return;   
+    }
+    bool server_connected = htclient.begin (C.analytics_url, C.speak_thumb_print);          
+    if (!server_connected) {
+        SERIAL_PRINTLN("Could not connect to analytics server");
+        return;   
+    }
+    if (C.verbose_mode)
+        SERIAL_PRINTLN("Connected to analytics server");
+    htclient.addHeader("Content-Type", "application/json");
+    if (C.verbose_mode)
+        SERIAL_PRINTLN(body2);
+    int retcode = htclient.POST(body2); 
+    SERIAL_PRINTLN(retcode);
+    if (retcode < 0) {
+        SERIAL_PRINTLN("Cannot POST to analytics server..");
+        SERIAL_PRINTLN(htclient.errorToString(retcode).c_str());
+    }
+    else {
+        String response = htclient.getString(); 
+        if (C.verbose_mode){
+            SERIAL_PRINTLN(response);
+            SERIAL_PRINTLN("");
+        }
+    }
+    //SERIAL_PRINTLN("Client disconnected.\n");
+    htclient.end();   // close     
+}

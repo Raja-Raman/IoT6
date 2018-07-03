@@ -1,0 +1,141 @@
+// Monitor rest room occupancy status and operate a relay to control lights
+// Uses two PIRs, (it ORs their output as a single signal) and one microwave radar.
+// It goes into testing mode where it only reads the staus of PIR and magnetic sensor.
+// PIR : HC-SR 501; RADAR : RCWL 0516 
+
+
+#include <Timer.h>            // Simon Monk:  http://www.simonmonk.org -> Jack Christensen
+
+const byte pir1    = 3;      
+const byte pir2    = A0;       
+const byte radar   = 4;      
+const byte led1    = 13;      
+const byte led2    = 5;       
+const byte jumper  = 12;  
+const byte relay   = 9;    
+
+Timer T;  // software timer
+
+// * Timer durations SHOULD be unsigned LONG int, if they are > 16 bit! 
+unsigned int tick_interval  = 100;       // in milliSec; 10 ticks = 1 second 
+unsigned int release_ticks  = 120*10;     // n*10 ticks = n seconds   // 60
+unsigned int buzzer_ticks   = 110*10;    // n*10 ticks = n seconds  // 50
+//----------------- end of configuration section -----------------------------------
+
+unsigned int tick_counter = 0;
+int num_hits = 0;  // how many sensors fired
+boolean  occupied = true;        // occupancy status of the room
+
+void setup() {    
+    pinMode(radar, INPUT);   
+    pinMode(pir1, INPUT);        
+    pinMode(pir2, INPUT);        
+    pinMode(relay, OUTPUT);         
+    pinMode(jumper, INPUT_PULLUP);    // jumper connected -> pin will be LOW  
+    boolean sensor_test_mode = !digitalRead(jumper);   // pin LOW -> enter sensor test loop
+    pinMode(led1, OUTPUT);    
+    pinMode(led2, OUTPUT);         
+    digitalWrite(led1, LOW);  // active high  
+    digitalWrite(led2, HIGH);  // active low  
+
+    blinker();   //  more time for 8266 to boot up and be ready for commands  
+    Serial.begin (115200);
+    Serial.println ("rest room controller starting..");
+
+    if (sensor_test_mode) {
+        Serial.println ("ENTERING SENSOR TEST MODE");
+        Serial.println ("For normal operation, disconnect jumper2 on CE pin [D8].");
+        sensor_test_loop();  // *** THIS IS AN INFINITE LOOP ****
+    }
+    else
+        Serial.println ("Starting regular code in production mode.");
+  
+    T.every(tick_interval, ticker);     
+    occupy_room();  
+}
+
+
+// WARNING: THIS IS AN INFINITE LOOP
+// for normal program, the jumper2 MUST be be disconnected
+void sensor_test_loop() {
+    blinker();
+    while (1) {
+        digitalWrite (led1, digitalRead(pir1) | digitalRead(pir2));     // active high
+        digitalWrite (led2, !digitalRead(radar));  // active low  
+        delay(20); 
+        // TODO: watchdog reset
+    }
+}
+
+// the normal program loop
+char c;
+void loop() {
+    T.update();          
+}
+
+void ticker(){
+    read_sensors();  // read PIR and radar...
+    update_status(); // ...and then compute occupancy status     
+}
+
+boolean pir_status; 
+boolean radar_status;
+// You MUST call this before calling update_status
+void read_sensors() { 
+    pir_status = digitalRead(pir1) | digitalRead(pir2);   // TODO: revisit
+    radar_status = digitalRead(radar);
+    digitalWrite (led1, pir_status);
+    digitalWrite (led2, !radar_status);
+    if (pir_status || radar_status)    // if there is any motion,  
+        tick_counter = 0;              // keep resetting it 
+}
+
+// uses the global variable num_hits: Call read_sensors before calling this !
+void update_status() {    
+    tick_counter++;    
+      
+    if (!occupied) {
+        if (pir_status && radar_status)    // both the sensors fired, so occupy the room
+            occupy_room();
+    }
+    if (tick_counter == buzzer_ticks) {
+        if (occupied)
+            warn();  // warn about the imminent release
+    }
+    if (tick_counter >= release_ticks){  
+         tick_counter = 0; // to avoid counter overflow during nights/holidays
+         if (occupied)
+            release_room();  
+    }
+}
+
+void occupy_room() {
+    occupied = true; 
+    Serial.println("Room ccupied");    
+    digitalWrite(relay, HIGH); // active high
+}
+
+// pre-release warning flashes
+void warn() {
+    T.oscillate (led2,50, HIGH, 10);  
+    //the end state is HIGH, i.e, led is off      
+    Serial.println("- About to release room -");    
+}
+
+void release_room() {
+    occupied = false; 
+    Serial.println("Room released");
+    digitalWrite(relay, LOW); // active high
+}
+
+void blinker() {
+    for (int i=0; i<6; i++) {  
+        digitalWrite(led1, HIGH); 
+        digitalWrite(led2, LOW);            
+        delay(300);      
+        digitalWrite(led1, LOW);    // active high    
+        digitalWrite(led2, HIGH);    // active low       
+        delay(300); 
+    } 
+}
+

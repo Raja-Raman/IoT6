@@ -1,0 +1,67 @@
+// Monitor rest room occupancy status and operate a relay to control lights
+// Uses two PIRs, (it ORs their output as a single signal) and one microwave radar.
+// It goes into testing mode where it only reads the staus of PIR and magnetic sensor.
+// PIR : HC-SR 501; RADAR : RCWL 0516 
+
+const byte pir1    = 3;      
+const byte pir2    = A0;       
+const byte radar   = 4;      
+const byte led1    = 13;      
+const byte led2    = 5;       
+const byte jumper  = 12;  
+const byte relay   = 9;    
+
+
+void setup() {    
+    pinMode(radar, INPUT);   
+    pinMode(pir1, INPUT);        
+    pinMode(pir2, INPUT);        
+    pinMode(relay, OUTPUT);         
+    pinMode(led1, OUTPUT);    
+    pinMode(led2, OUTPUT);        
+    digitalWrite(relay, LOW);  // active high
+    digitalWrite(led1, LOW);  // active high  
+    digitalWrite(led2, HIGH);  // active low  
+
+    pinMode(jumper, INPUT_PULLUP);    // jumper connected -> pin will be LOW  
+    boolean jumper_status = digitalRead(jumper);   // pin LOW -> enter sensor test loop
+    
+    blinker();   //  more time for 8266 to boot up and be ready for commands  
+    Serial.begin (115200);
+    Serial.println ("rest room controller tests starting..");
+    Serial.print ("Sensor test mode jumper status = ");
+    Serial.println (jumper_status); 
+}
+
+// comment out one of these two tests
+void loop() {
+    sensor_test();   
+//    relay_test();
+}
+
+// comment out two of these two tests
+void sensor_test() {
+//    digitalWrite (led2, !digitalRead(pir1)); // active low  led
+//    digitalWrite (led2, !digitalRead(pir2));
+    digitalWrite (led2, !digitalRead(radar));  
+    delay(50); 
+}
+    
+void relay_test() {
+    digitalWrite (relay, HIGH);  
+    delay(5000);
+    digitalWrite (relay, LOW);  
+    delay(10000);    
+}
+
+void blinker() {
+    for (int i=0; i<6; i++) {  
+        digitalWrite(led1, HIGH); 
+        digitalWrite(led2, LOW);            
+        delay(300);      
+        digitalWrite(led1, LOW);    // active high    
+        digitalWrite(led2, HIGH);    // active low       
+        delay(300); 
+    } 
+}
+
