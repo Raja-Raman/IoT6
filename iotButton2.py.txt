@@ -1,0 +1,60 @@
+# MQTT listener triggers email. Use it with any IoT button.
+# dependencies: mailer.py (written by me).
+
+# https://www.hivemq.com/blog/mqtt-client-library-paho-python
+# see it at http://www.hivemq.com/demos/websocket-client/
+
+# pip install paho-mqtt
+
+import paho.mqtt.client as mqtt
+from mailer import Mailer
+import random
+import time
+import sys
+
+#------------------------------ globals ------------------------------
+server = 'broker.mqttdashboard.com'
+port = 1883
+client = None
+topic1 = 'ind/che/vel/maa/407/com'
+topic2 = 'ind/che/vel/maa/407/res'
+
+#------------------------------ callbacks ---------------------------- 
+
+def on_connect(client, userdata, flags, rc):
+    print('Connected to MQTT server. Ack code= %d.' % (rc))
+ 
+def on_publish(client, userdata, mid):
+    print("published msg id: "+str(mid))
+
+def on_subscribe(client, userdata, mid, granted_qos):
+    print("Subscribed to " + topic1)
+    print("mid= " + str(mid) + ", granted QOS=" + str(granted_qos))
+    
+def on_message(client, userdata, msg):
+    print(msg.topic+"-> " +str(msg.payload)) 
+    mailer.send ("raman_raja@hotmail.com",  #"rajaraman.v@gmail.com", 
+                 "Service request #" +str(random.randint(1,200)), 
+                  str(msg.payload.decode("utf-8")))    
+#---------------------------- main -----------------------------------
+
+mailer = Mailer("raidya@gmail.com", "password")
+     
+# client = mqtt.Client("raman_rajas_client_1963", clean_session=False)
+# client.username_pw_set("User", "password")     
+client = mqtt.Client()
+
+client.on_connect = on_connect
+client.on_publish = on_publish
+client.on_subscribe = on_subscribe
+client.on_message = on_message
+
+client.connect(server, port, keepalive=60)    # blocking call
+
+client.subscribe (topic1, qos=0)
+print ("Listening for MQTT messages")
+print ('\nPress ^C to quit...\n')
+
+client.loop_forever()    # blocking call - reconnects automatically 
+  
+print ('Main thread quits.')
