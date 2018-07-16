@@ -4,6 +4,7 @@
 
 import smtplib
 import email
+import email.message
 
 class Mailer:
 
