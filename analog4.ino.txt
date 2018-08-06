@@ -1,0 +1,266 @@
+// Reads analog input (Soil moisture sensor)
+// and sends to MQTT, which in turn feeds MQTTDash mobile app
+// OTA updates through a local web server 
+// Power up the moisture sensor through a transistor 2N2222, so it can be put to sleep.
+
+// OTA update procedure:
+// Start a python web server in some folder. This is the web server root.
+// python -m  http.server  8000
+// Increment the variable FW_VERSION in the code below
+// from Sketch menu, choose Export compiled binary. 
+// Copy the bin file to the ota folder under your web server home; rename it suitably.
+// Edit the file ota/version.txt on the server and increment the version number.
+// Run this code on 8266.  
+
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>  // https://github.com/knolleary/pubsubclient
+#include <Timer.h>         // Simon Monk:  http://www.simonmonk.org -> Jack Christensen
+//#include <ESP8266WiFiMulti.h>
+
+const int FW_VERSION = 3;  // increment this every time before compiling  
+
+const char * app_name = "analog";  // the image file should be renamed analog.bin
+// run a local web server on your PC here:  [TO DO: call a service end point, not a file URL]
+//const char* ota_base_url = "http://192.168.3.10:8000/ota/";
+const char* ota_base_url = "http://192.168.1.26:8000/ota/";
+
+// LED connected to Rx will work only if debug is not enabled
+#define ENABLE_DEBUG
+
+#ifdef ENABLE_DEBUG
+  #define  SERIAL_PRINT(x)    Serial.print(x)
+  #define  SERIAL_PRINTLN(x)  Serial.println(x)
+  #define  SERIAL_PRINTF(x,y) Serial.printf(x,y)
+#else
+  #define  SERIAL_PRINT(x)   
+  #define  SERIAL_PRINTLN(x)   
+  #define  SERIAL_PRINTF(x,y)
+#endif
+
+long baud_rate = 115200L;
+// Wi-Fi
+const char* ssid1 = "ssid";
+const char* password1 = "passwd";
+// MQTT
+boolean fire_mqtt = true;
+const char* mqtt_server = "broker.mqttdashboard.com";
+int mqtt_port = 1883;
+char* topic = "my/topic/pla";
+char mqtt_msg[32]; 
+boolean comm_success = false;
+
+WiFiClient wifi_client;
+PubSubClient mqtt_client(wifi_client);
+Timer T;  // software timer
+
+int led1  = 2;   // GPIO 2, D4
+int sensor_enable_pin = D2;  // A high on this pin extends power supply to the moisture sensor
+long deep_sleep_delay = 60L * 1000L * 1000L;    // 60 sec
+
+void setup() {
+    pinMode(led1, OUTPUT); 
+    pinMode(sensor_enable_pin, OUTPUT);     
+    #ifdef ENABLE_DEBUG
+        Serial.begin(baud_rate);  // if you are using Rx pin for I/O, do not begin serial
+    #endif        
+    blinker();     
+    SERIAL_PRINTLN("");
+    SERIAL_PRINTLN("\nStarting plant watering automaton..");
+    SERIAL_PRINT ("Firmware version: ");
+    SERIAL_PRINTLN (FW_VERSION);      
+    
+    randomSeed(micros());
+    WiFi.mode(WIFI_STA);
+    setup_wifi();  
+    //setup_wifi_multi(); 
+    digitalWrite(sensor_enable_pin, HIGH); // activate the sensor through 2N2222 & let it stabilize    
+    T.after(50, check_for_updates);
+}
+
+void loop() {  
+    T.update();    
+    //wifi_multi.run();
+    mqtt_client.loop();          
+}
+
+void send_mqtt(int value) {
+    if (fire_mqtt) {  
+        if (reconnect_mqtt()) {
+            SERIAL_PRINT("Publishing to topic: ");
+            SERIAL_PRINTLN(topic);        
+            SERIAL_PRINT("Message: ");
+            sprintf(mqtt_msg, "%d", value);   
+            SERIAL_PRINTLN(mqtt_msg);
+            mqtt_client.publish(topic, mqtt_msg);
+        }
+    }
+}
+
+void sleep_deep() {
+    SERIAL_PRINTLN("About to go to sleep..");
+    blinker();
+    ESP.deepSleep(deep_sleep_delay);  // must be in microseconds
+}
+
+void setup_wifi() {
+    SERIAL_PRINT("Connecting to: ");
+    SERIAL_PRINTLN(ssid1);
+    WiFi.begin(ssid1, password1);
+    int MAX_ATTEMPTS = 20;  // 10 seconds
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+      digitalWrite(led1, LOW); 
+      delay(250);
+      digitalWrite(led1, HIGH); 
+      delay(250);      
+      SERIAL_PRINT(".");
+      attempts++;
+      if (attempts > MAX_ATTEMPTS)
+          break;
+    }
+    SERIAL_PRINTLN("!");
+    if (WiFi.status() != WL_CONNECTED) {
+        SERIAL_PRINTLN("- Could not connect to WiFi -");
+        digitalWrite(led1, LOW); // LED on
+    } else {
+        SERIAL_PRINTLN("WiFi connected");
+        SERIAL_PRINTLN("IP address: ");
+        SERIAL_PRINTLN(WiFi.localIP());
+        digitalWrite(led1, HIGH);  // LED off
+    }
+}
+/**********
+void setup_wifi_multi() {
+    wifi_multi.addAP(ssid1, password1);
+    wifi_multi.addAP(ssid2, password2);  
+    if (wifi_multi.run()  != WL_CONNECTED) {
+        SERIAL_PRINTLN("- Could not connect to WiFi -");
+        digitalWrite(led2, LOW); // LED on
+    } else {
+        SERIAL_PRINTLN("WiFi connected");
+        SERIAL_PRINTLN("IP address: ");
+        SERIAL_PRINTLN(WiFi.localIP());
+        digitalWrite(led2, HIGH);  // LED off
+    }
+}
+************/
+
+bool reconnect_mqtt() {
+    mqtt_client.setServer(mqtt_server, mqtt_port);  
+    if (!mqtt_client.connected())  {
+        SERIAL_PRINTLN("Conneting to MQTT server..");
+        // Create a random client ID
+        String clientId = "RJRMN-Plant-";
+        clientId += String(random(0xffff), HEX);
+        SERIAL_PRINT("clientId : ");
+        SERIAL_PRINTLN(clientId);
+        // Attempt to connect
+        boolean result = mqtt_client.connect(clientId.c_str());
+        if (result) {
+            SERIAL_PRINT("connected to MQTT server; rc=");
+            SERIAL_PRINTLN(mqtt_client.state());    
+            comm_success = true;  
+        } else {
+            SERIAL_PRINT("Connection failed; rc=");
+            SERIAL_PRINTLN(mqtt_client.state());
+            comm_success = false;
+        }
+    }
+    return (comm_success);
+}
+
+void check_for_updates() { 
+    if (check_version())
+        update_firmware();
+    T.after(50, update_data);
+}
+
+void update_data() {
+    int anaval = 0;
+    for (int i=0; i<5; i++) {
+        anaval += analogRead(A0);
+        delay(10);
+    }
+    anaval = anaval / 5;
+    SERIAL_PRINT ("Analog value: ");
+    SERIAL_PRINTLN (anaval);
+    send_mqtt(anaval);
+    digitalWrite(sensor_enable_pin, LOW); // remove power to the sensor  
+    T.after(50, sleep_deep);   
+}
+
+boolean check_version() {
+    HTTPClient client;
+    SERIAL_PRINTLN("Checking for firmware updates...");
+    String version_url = ota_base_url;
+    version_url.concat("version.txt");
+    SERIAL_PRINT("Firmware version file: ");
+    SERIAL_PRINTLN(version_url);
+
+    boolean result = false;
+    client.begin(version_url);
+    int httpCode = client.GET();
+    if(httpCode == 200) {
+        String str_version = client.getString();
+        SERIAL_PRINT("Current firmware version: ");
+        SERIAL_PRINTLN(FW_VERSION);
+        SERIAL_PRINT("Available firmware version: ");
+        SERIAL_PRINTLN(str_version);
+        int newVersion = str_version.toInt();
+        if(newVersion > FW_VERSION) {
+            SERIAL_PRINTLN ("New version is available");
+            result = true;
+        } else { 
+            SERIAL_PRINTLN("This device already has the latest version");
+            result = false;
+        }
+    } else {
+        SERIAL_PRINT( "Cannot check firmware version. HTTP error code: " );
+        SERIAL_PRINTLN( httpCode );      
+        result = false;
+    }
+    client.end();
+    return (result);
+}    
+
+void update_firmware() {
+    String bin_url = ota_base_url;
+    bin_url.concat(app_name);    
+    bin_url.concat(".bin");
+    SERIAL_PRINT("Looking for the image file: ");
+    SERIAL_PRINTLN(bin_url);
+    SERIAL_PRINTLN("Updating firmware..");
+    
+    ESPhttpUpdate.rebootOnUpdate(true);  // default is to reboot
+    t_httpUpdate_return ret = ESPhttpUpdate.update(bin_url);
+
+    SERIAL_PRINT("Return code: ");
+    SERIAL_PRINTLN(ret);
+    switch (ret) {
+        case HTTP_UPDATE_OK:
+            SERIAL_PRINTLN("HTTP update success !");
+            break;
+        case HTTP_UPDATE_FAILED:
+            SERIAL_PRINT("HTTP update FAILD. Error code = ");
+            SERIAL_PRINTLN (ESPhttpUpdate.getLastError()); 
+            SERIAL_PRINTLN (ESPhttpUpdate.getLastErrorString().c_str());
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            SERIAL_PRINTLN("NO updates available");
+            break;
+    }  
+}
+
+void blinker() {
+    for (int i=0; i<10; i++) {
+        digitalWrite(led1, LOW); 
+        delay(80);
+        digitalWrite(led1, HIGH); 
+        delay(80);    
+    }
+}
+
+
+
