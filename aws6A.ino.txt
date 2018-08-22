@@ -1,0 +1,84 @@
+// https://github.com/Schm1tz1/aws-sdk-arduino-esp8266/blob/master/examples/SimpleExample/SimpleExample.ino
+// see the status updates at https://us-west-2.console.aws.amazon.com/iot/home?region=us-west-2#/thing/first_thing
+
+ //#include <HTTPClient.h> // for ESP32 only
+#include <WiFiClient.h>
+#include <ESP8266WiFi.h>
+#include <AmazonIOTClient.h>          //  https://github.com/Schm1tz1/aws-sdk-arduino-esp8266
+#include "EspAWSImplementations.h"    //  https://github.com/Schm1tz1/aws-sdk-arduino-esp8266
+
+char* ssid = "your_ssid";
+char* password = "your_password";
+
+EspHttpClient httpClient;
+EspDateTimeProvider dateTimeProvider;
+AmazonIOTClient iotClient;
+ActionError actionError;
+
+void setup() {
+  Serial.begin(115200);
+  delay(10);
+  Serial.println("\n\n****************** RESTARTING ****************************\n\n");
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  iotClient.setAWSRegion("us-west-2");
+  iotClient.setAWSDomain("B0v0ws394i7ne9xx.iot.us-west-2.amazonaws.com");  
+  iotClient.setAWSEndpoint("amazonaws.com");
+  iotClient.setAWSPath("/things/first_thing/shadow");
+  
+  iotClient.setAWSKeyID("your key id");
+  iotClient.setAWSSecretKey("your key");
+  iotClient.setHttpClient(&httpClient);
+  iotClient.setDateTimeProvider(&dateTimeProvider);
+}
+
+long node_id = 1234L;
+long group_id = 123L;
+int occupied = 0;
+int temperature = 30;
+int humidity = 10;
+int light = 60;
+int sound = 90;
+int air = 50;
+int extra1 = 0;
+int extra2 = 0;
+
+char payload[256];
+
+void loop(){
+  // the node names MUST only be 'state' and 'reported'
+  // otherwise you get a 'Bad request' response
+  sprintf (payload, 
+  "{\"state\":{\"reported\":{\"node_id\":%ld, \"group_id\":%ld, \"occupied\":%d, \"temperature\":%d, \"humidity\":%d, \"light\":%d, \"sound\":%d, \"air\":%d, \"extra1\":%d, \"extra2\":%d}}}",
+  node_id,group_id,occupied,temperature,humidity,light,sound,air,extra1,extra2);
+  
+  Serial.println(payload);
+  Serial.print("\nPayload length: ");
+  Serial.println(strlen(payload));
+  
+  occupied = !occupied;
+  temperature = (temperature+1)%50+10;
+  humidity = (humidity+1)%100+1;
+  light = (light+1)%100;
+  sound = (sound +1)%100;
+  air = (air+1)%100;
+  extra1 = (extra1+1)%100;
+  extra2 = (extra2+1)%100;
+    
+  char* result = (char *) iotClient.update_shadow(payload, actionError);
+  Serial.print(result);
+
+  ESP.wdtFeed();  // is this needed ?
+  delay(20000);
+}
